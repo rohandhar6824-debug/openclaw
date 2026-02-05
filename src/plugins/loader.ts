@@ -168,7 +168,11 @@ export function loadOpenClawPlugins(options: PluginLoadOptions = {}): PluginRegi
   const cfg = options.config ?? {};
   const logger = options.logger ?? defaultLogger();
   const validateOnly = options.mode === "validate";
-  const normalized = normalizePluginsConfig(cfg.plugins);
+  
+  // Ensure plugins configuration exists before normalizing
+  const pluginsConfig = cfg.plugins || { entries: {}, loadPaths: [] };
+  const normalized = normalizePluginsConfig(pluginsConfig);
+  
   const cacheKey = buildCacheKey({
     workspaceDir: options.workspaceDir,
     plugins: normalized,
