@@ -97,28 +97,48 @@ function parseCallbackInput(input: string): { code: string; state: string } | { 
   }
 
   try {
-    const url = new URL(trimmed);
-    const code = url.searchParams.get("code");
-    const state = url.searchParams.get("state");
-    if (!code) {
-      return { error: "Missing 'code' parameter in URL" };
+    // Handle both full URLs and just the code+state fragment
+    if (trimmed.startsWith("http")) {
+      const url = new URL(trimmed);
+      const code = url.searchParams.get("code");
+      const state = url.searchParams.get("state");
+      if (!code) {
+        return { error: "Missing 'code' parameter in URL" };
+      }
+      if (!state) {
+        return { error: "Missing 'state' parameter in URL" };
+      }
+      return { code, state };
+    } else {
+      // Try to parse as URLSearchParams format (e.g., "code=...&state=...")
+      const params = new URLSearchParams(trimmed);
+      const code = params.get("code");
+      const state = params.get("state");
+      if (!code) {
+        return { error: "Missing 'code' parameter" };
+      }
+      if (!state) {
+        return { error: "Missing 'state' parameter" };
+      }
+      return { code, state };
     }
-    if (!state) {
-      return { error: "Missing 'state' parameter in URL" };
-    }
-    return { code, state };
   } catch {
-    return { error: "Paste the full redirect URL (not just the code)." };
+    return { error: "Paste the full redirect URL or the code and state parameters" };
   }
 }
 
-async function startCallbackServer(params: { timeoutMs: number }) {
+interface CallbackServer {
+  waitForCallback: () => Promise<URL>;
+  close: () => Promise<void>;
+}
+
+async function startCallbackServer(params: { timeoutMs: number }): Promise<CallbackServer> {
   const redirect = new URL(REDIRECT_URI);
   const port = redirect.port ? Number(redirect.port) : 51121;
 
   let settled = false;
-  let resolveCallback: (url: URL) => void;
-  let rejectCallback: (err: Error) => void;
+  let resolveCallback: ((url: URL) => void) | null = null;
+  let rejectCallback: ((err: Error) => void) | null = null;
 
   const callbackPromise = new Promise<URL>((resolve, reject) => {
     resolveCallback = (url) => {
@@ -138,9 +158,15 @@ async function startCallbackServer(params: { timeoutMs: number }) {
   });
 
   const timeout = setTimeout(() => {
-    rejectCallback(new Error("Timed out waiting for OAuth callback"));
+    if (rejectCallback) {
+      rejectCallback(new Error("Timed out waiting for OAuth callback"));
+    }
   }, params.timeoutMs);
-  timeout.unref?.();
+  
+  // Safely unref the timeout if possible
+  if (typeof timeout.unref === "function") {
+    timeout.unref();
+  }
 
   const server = createServer((request, response) => {
     if (!request.url) {
@@ -158,7 +184,10 @@ async function startCallbackServer(params: { timeoutMs: number }) {
 
     response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     response.end(RESPONSE_PAGE);
-    resolveCallback(url);
+    
+    if (resolveCallback) {
+      resolveCallback(url);
+    }
 
     setImmediate(() => {
       server.close();
@@ -181,6 +210,7 @@ async function startCallbackServer(params: { timeoutMs: number }) {
     waitForCallback: () => callbackPromise,
     close: () =>
       new Promise<void>((resolve) => {
+        clearTimeout(timeout);
         server.close(() => resolve());
       }),
   };
@@ -205,7 +235,7 @@ async function exchangeCode(params: {
 
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(`Token exchange failed: ${text}`);
+    throw new Error(`Token exchange failed: ${response.status} ${text}`);
   }
 
   const data = (await response.json()) as {
@@ -296,13 +326,18 @@ async function fetchProjectId(accessToken: string): Promise<string> {
   return DEFAULT_PROJECT_ID;
 }
 
+interface LoginProgress {
+  update: (msg: string) => void;
+  stop: (msg?: string) => void;
+}
+
 async function loginAntigravity(params: {
   isRemote: boolean;
   openUrl: (url: string) => Promise<void>;
   prompt: (message: string) => Promise<string>;
   note: (message: string, title?: string) => Promise<void>;
   log: (message: string) => void;
-  progress: { update: (msg: string) => void; stop: (msg?: string) => void };
+  progress: LoginProgress;
 }): Promise<{
   access: string;
   refresh: string;
@@ -314,12 +349,14 @@ async function loginAntigravity(params: {
   const state = randomBytes(16).toString("hex");
   const authUrl = buildAuthUrl({ challenge, state });
 
-  let callbackServer: Awaited<ReturnType<typeof startCallbackServer>> | null = null;
+  let callbackServer: CallbackServer | null = null;
   const needsManual = shouldUseManualOAuthFlow(params.isRemote);
+  
   if (!needsManual) {
     try {
       callbackServer = await startCallbackServer({ timeoutMs: 5 * 60 * 1000 });
-    } catch {
+    } catch (err) {
+      params.log(`Failed to start callback server: ${err instanceof Error ? err.message : String(err)}`);
       callbackServer = null;
     }
   }
@@ -342,12 +379,12 @@ async function loginAntigravity(params: {
     params.log("");
   }
 
-  if (!needsManual) {
+  if (!needsManual && callbackServer) {
     params.progress.update("Opening Google sign-in…");
     try {
       await params.openUrl(authUrl);
-    } catch {
-      // ignore
+    } catch (err) {
+      params.log(`Failed to open URL: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -362,7 +399,7 @@ async function loginAntigravity(params: {
     await callbackServer.close();
   } else {
     params.progress.update("Waiting for redirect URL…");
-    const input = await params.prompt("Paste the redirect URL: ");
+    const input = await params.prompt("Paste the redirect URL or code parameters: ");
     const parsed = parseCallbackInput(input);
     if ("error" in parsed) {
       throw new Error(parsed.error);
@@ -380,7 +417,11 @@ async function loginAntigravity(params: {
 
   params.progress.update("Exchanging code for tokens…");
   const tokens = await exchangeCode({ code, verifier });
+  
+  params.progress.update("Fetching user information…");
   const email = await fetchUserEmail(tokens.access);
+  
+  params.progress.update("Fetching project ID…");
   const projectId = await fetchProjectId(tokens.access);
 
   params.progress.stop("Antigravity OAuth complete");
@@ -392,7 +433,7 @@ const antigravityPlugin = {
   name: "Google Antigravity Auth",
   description: "OAuth flow for Google Antigravity (Cloud Code Assist)",
   configSchema: emptyPluginConfigSchema(),
-  register(api) {
+  register(api: any) {
     api.registerProvider({
       id: "google-antigravity",
       label: "Google Antigravity",
@@ -404,7 +445,7 @@ const antigravityPlugin = {
           label: "Google OAuth",
           hint: "PKCE + localhost callback",
           kind: "oauth",
-          run: async (ctx) => {
+          run: async (ctx: any) => {
             const spin = ctx.prompter.progress("Starting Antigravity OAuth…");
             try {
               const result = await loginAntigravity({
